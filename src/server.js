@@ -102,6 +102,25 @@ process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 debug(`[token] Final resolved token: ${OPENCLAW_GATEWAY_TOKEN.slice(0, 16)}... (len: ${OPENCLAW_GATEWAY_TOKEN.length})`);
 console.log(`[token] ========== TOKEN RESOLUTION COMPLETE ==========\n`);
 
+// ========== STARTUP STATE TRACKING ==========
+// Track wrapper startup phases to provide better UX during cold starts
+const StartupState = {
+  UNCONFIGURED: "UNCONFIGURED", // No openclaw.json exists yet
+  STARTING: "STARTING",         // Gateway is booting up
+  READY: "READY",               // Gateway is ready and healthy
+  ERROR: "ERROR",               // Gateway failed to start or crashed
+};
+
+let currentStartupState = StartupState.UNCONFIGURED;
+let startupStateReason = "Wrapper initializing...";
+let gatewayStartTime = null;
+
+function setStartupState(state, reason = "") {
+  currentStartupState = state;
+  startupStateReason = reason;
+  console.log(`[startup-state] → ${state}${reason ? `: ${reason}` : ""}`);
+}
+
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(
   process.env.INTERNAL_GATEWAY_PORT ?? "18789",
@@ -326,7 +345,7 @@ function sleep(ms) {
 }
 
 async function waitForGatewayReady(opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 60_000;  // Increased from 20s to 60s for Railway startup
+  const timeoutMs = opts.timeoutMs ?? 120_000;  // Increased from 60s to 120s for Railway cold starts
   const start = Date.now();
   const endpoints = ["/openclaw", "/openclaw", "/", "/health"];
   
@@ -339,6 +358,7 @@ async function waitForGatewayReady(opts = {}) {
           const elapsed = ((Date.now() - start) / 1000).toFixed(1);
           console.log(`[gateway] ready at ${endpoint} (${elapsed}s elapsed)`);
           gatewayHealthy = true;
+          setStartupState(StartupState.READY, `Gateway ready after ${elapsed}s`);
           return true;
         }
       } catch (err) {
@@ -350,12 +370,16 @@ async function waitForGatewayReady(opts = {}) {
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
   console.warn(`[gateway] initial readiness check timed out after ${elapsed}s, but gateway may still be starting...`);
   console.warn(`[gateway] continuing health monitoring in background`);
+  // Don't set ERROR state - background monitor may still succeed
   return false;
 }
 
 async function startGateway() {
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
+
+  setStartupState(StartupState.STARTING, "Initializing gateway...");
+  gatewayStartTime = Date.now();
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
@@ -438,6 +462,7 @@ async function startGateway() {
     const msg = `[gateway] spawn error: ${String(err)}`;
     console.error(msg);
     lastGatewayError = msg;
+    setStartupState(StartupState.ERROR, `Spawn error: ${err.message}`);
     gatewayProc = null;
   });
 
@@ -445,6 +470,7 @@ async function startGateway() {
     const msg = `[gateway] exited code=${code} signal=${signal}`;
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
+    setStartupState(StartupState.ERROR, `Gateway exited: code=${code} signal=${signal}`);
     gatewayProc = null;
     gatewayHealthy = false;
   });
@@ -471,8 +497,10 @@ function startBackgroundHealthMonitor() {
           signal: AbortSignal.timeout(5000)
         });
         if (res) {
-          console.log(`[gateway] background health check: gateway is NOW HEALTHY`);
+          const elapsed = gatewayStartTime ? Math.floor((Date.now() - gatewayStartTime) / 1000) : 0;
+          console.log(`[gateway] background health check: gateway is NOW HEALTHY (${elapsed}s elapsed)`);
           gatewayHealthy = true;
+          setStartupState(StartupState.READY, `Gateway ready after ${elapsed}s (background check)`);
           clearInterval(healthMonitorInterval);
           healthMonitorInterval = null;
         }
@@ -504,7 +532,10 @@ async function runDoctorBestEffort() {
 }
 
 async function ensureGatewayRunning() {
-  if (!isConfigured()) return { ok: false, reason: "not configured" };
+  if (!isConfigured()) {
+    setStartupState(StartupState.UNCONFIGURED, "No openclaw.json found");
+    return { ok: false, reason: "not configured" };
+  }
   if (gatewayProc) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
@@ -512,7 +543,7 @@ async function ensureGatewayRunning() {
         lastGatewayError = null;
         gatewayHealthy = false;
         await startGateway();
-        const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
+        const ready = await waitForGatewayReady({ timeoutMs: 120_000 });
         if (!ready) {
           console.warn(`[gateway] Initial readiness check timed out, but background monitor will continue checking`);
           // Don't throw error - background monitor will detect when ready
@@ -520,6 +551,7 @@ async function ensureGatewayRunning() {
       } catch (err) {
         const msg = `[gateway] start failure: ${String(err)}`;
         lastGatewayError = msg;
+        setStartupState(StartupState.ERROR, `Start failed: ${err.message}`);
         // Collect extra diagnostics to help users file issues.
         await runDoctorBestEffort();
         throw err;
@@ -672,6 +704,18 @@ app.get("/healthz", async (_req, res) => {
       lastExit: lastGatewayExit,
       lastDoctorAt,
     },
+  });
+});
+
+// Startup status endpoint (no auth) for monitoring gateway boot progress
+app.get("/startup-status", (_req, res) => {
+  const elapsed = gatewayStartTime ? Date.now() - gatewayStartTime : null;
+  res.json({
+    state: currentStartupState,
+    reason: startupStateReason,
+    elapsedMs: elapsed,
+    configured: isConfigured(),
+    gatewayProcessRunning: !!gatewayProc,
   });
 });
 
@@ -2020,6 +2064,17 @@ const proxy = httpProxy.createProxyServer({
 // Prevent proxy errors from crashing the wrapper.
 // Common errors: ECONNREFUSED (gateway not ready), ECONNRESET (client disconnect).
 proxy.on("error", (err, req, res) => {
+  // Suppress ECONNREFUSED spam during normal gateway startup
+  if (err.code === "ECONNREFUSED" && currentStartupState === StartupState.STARTING) {
+    debug(`[proxy] Suppressed ECONNREFUSED during startup (${req?.method} ${req?.url})`);
+    // Don't log or respond - gateway is still booting, this is expected
+    if (res && !res.headersSent) {
+      res.writeHead(503, { "Content-Type": "text/plain" });
+      res.end("Gateway is starting up, please wait...");
+    }
+    return;
+  }
+
   console.error("[proxy] error:", err.message, `(${req?.method} ${req?.url})`);
   
   // Only send error response if headers haven't been sent yet
@@ -2032,6 +2087,7 @@ proxy.on("error", (err, req, res) => {
         "",
         "Troubleshooting:",
         "- Visit /healthz for gateway status",
+        "- Visit /startup-status for boot progress",
         "- Visit /setup/api/debug for full diagnostics",
         "- Check Debug Console in /setup",
         "- Run 'gateway.restart' in Debug Console",
@@ -2063,6 +2119,42 @@ app.use(async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
+  }
+
+  // Show startup page if gateway is still booting
+  if (currentStartupState === StartupState.STARTING && !req.path.startsWith("/setup") && req.path !== "/startup-status") {
+    const elapsed = gatewayStartTime ? Math.floor((Date.now() - gatewayStartTime) / 1000) : 0;
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenClaw Starting...</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .container { text-align: center; max-width: 600px; padding: 2rem; }
+    h1 { font-size: 2rem; margin-bottom: 1rem; color: #fff; }
+    .status { font-size: 1.2rem; color: #888; margin-bottom: 2rem; }
+    .spinner { border: 4px solid #333; border-top: 4px solid #0066ff; border-radius: 50%; width: 60px; height: 60px; animation: spin 1s linear infinite; margin: 2rem auto; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .elapsed { font-size: 0.9rem; color: #666; margin-top: 1rem; }
+    code { background: #1a1a1a; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.9rem; }
+  </style>
+  <script>
+    setTimeout(() => location.reload(), 3000);
+  </script>
+</head>
+<body>
+  <div class="container">
+    <div class="spinner"></div>
+    <h1>OpenClaw is starting up...</h1>
+    <div class="status">${startupStateReason || "Gateway is booting"}</div>
+    <div class="elapsed">Elapsed: ${elapsed}s | This page will refresh automatically</div>
+    <div class="elapsed" style="margin-top: 2rem;">Check <code>/startup-status</code> for JSON status or <code>/healthz</code> for health probe</div>
+  </div>
+</body>
+</html>`;
+    return res.status(503).type("text/html").send(html);
   }
 
   if (isConfigured()) {
